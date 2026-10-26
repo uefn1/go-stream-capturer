@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -33,6 +34,7 @@ func main() {
 	minutes := flag.Int("minutes", 0, "recording minutes")
 	split := flag.Int("split", 600, "split seconds")
 	outDir := flag.String("out", "out", "output prefix")
+	tag := flag.String("tag", "", "github release tag for auto upload")
 	flag.Parse()
 
 	if *m3uURL == "" || *minutes == 0 {
@@ -63,9 +65,9 @@ func main() {
 		go downloader(ctx, &wg, taskChan, resultChan)
 	}
 
-	// 書き込み・順序管理・ファイルローテーション
+	// 書き込み・順序管理・ファイルローテーション・逐次アップロード
 	wg.Add(1)
-	go writer(ctx, &wg, resultChan, firstSeqChan, *outDir, *split)
+	go writer(ctx, &wg, resultChan, firstSeqChan, *outDir, *split, *tag)
 
 	wg.Wait()
 	log.Println("Recording finished")
@@ -251,7 +253,7 @@ func downloadWithRetry(ctx context.Context, client *http.Client, targetURL strin
 	}
 }
 
-func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Downloaded, firstSeqChan <-chan uint64, outPrefix string, splitSec int) {
+func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Downloaded, firstSeqChan <-chan uint64, outPrefix string, splitSec int, tag string) {
 	defer wg.Done()
 	buffer := make(map[uint64][]byte)
 	var nextSeq uint64
@@ -260,26 +262,59 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 	var currentFile *os.File
 	var currentFileIdx int
 	var fileOpenTime time.Time
+	var currentFilename string
 
-	closeFile := func() {
+	var uploadWg sync.WaitGroup
+
+	// ファイルを閉じて、別ゴルーチンでGitHubへアップロード
+	closeAndUpload := func(f *os.File, fname string) {
+		f.Close()
+		if tag != "" {
+			uploadWg.Add(1)
+			go func(name string) {
+				defer uploadWg.Done()
+				log.Printf("Start uploading %s to release %s\n", name, tag)
+				for retry := 0; retry < 3; retry++ {
+					cmd := exec.Command("gh", "release", "upload", tag, name, "--clobber")
+					cmd.Stdout = os.Stdout
+					cmd.Stderr = os.Stderr
+					if err := cmd.Run(); err == nil {
+						log.Printf("Successfully uploaded %s\n", name)
+						os.Remove(name) // アップロード成功後にローカルファイルを削除
+						return
+					}
+					log.Printf("Failed to upload %s (attempt %d/3): %v\n", name, retry+1, err)
+					time.Sleep(5 * time.Second)
+				}
+			}(fname)
+		}
+	}
+
+	closeCurrentFile := func() {
 		if currentFile != nil {
-			currentFile.Close()
+			closeAndUpload(currentFile, currentFilename)
 			currentFile = nil
 		}
 	}
-	defer closeFile()
+
+	// プログラム終了時に現在書き込み中のファイルを閉じ、全てのアップロード完了を待機
+	defer func() {
+		closeCurrentFile()
+		uploadWg.Wait()
+	}()
 
 	checkRotation := func() error {
 		if currentFile == nil || time.Since(fileOpenTime).Seconds() >= float64(splitSec) {
-			closeFile()
-			filename := fmt.Sprintf("%s-%03d.ts", outPrefix, currentFileIdx)
-			f, err := os.Create(filename)
+			closeCurrentFile()
+			currentFilename = fmt.Sprintf("%s-%03d.ts", outPrefix, currentFileIdx)
+			f, err := os.Create(currentFilename)
 			if err != nil {
 				return err
 			}
 			currentFile = f
 			currentFileIdx++
 			fileOpenTime = time.Now()
+			log.Printf("Created new file: %s\n", currentFilename)
 		}
 		return nil
 	}
