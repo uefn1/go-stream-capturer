@@ -3,5 +3,10 @@
     "short_name": "Tigo",
     "formal_name": "Tigo Sports (Paraguay)",
     "m3u_url": "http://45.134.141.161:2200/ARG/Tigo_Sports/tracks-v1a1/mono.m3u8"
+  },
+  {
+    "short_name": "FIFA+",
+    "formal_name": "FIFA+ (720p)",
+    "m3u_url": "https://jmp2.uk/plu-660c29b5aec9680008f5b4a4.m3u8"
   }
 ]
