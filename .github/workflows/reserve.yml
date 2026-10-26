@@ -1,0 +1,43 @@
+name: Reserve
+on:
+  workflow_dispatch:
+    inputs:
+      channel_short_name:
+        description: 'channel short name (e.g. nittele)'
+        required: true
+        type: string
+      start_time_JST:
+        description: 'YYYY-MM-DD HH:MM (JST)'
+        required: true
+        type: string
+      minutes:
+        description: '録画時間（分）'
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  reserve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: create reserve json
+        run: |
+          RAND=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1)
+          D=$(echo "${{ inputs.start_time_JST }}" | tr ' :' '_-')
+          FILENAME="queue/${D}-${{ inputs.channel_short_name }}-${{ inputs.minutes }}m_${RAND}.json"
+          
+          jq -n \
+            --arg c "${{ inputs.channel_short_name }}" \
+            --arg s "${{ inputs.start_time_JST }}" \
+            --argjson m "${{ inputs.minutes }}" \
+            '{channel: $c, start_at: $s, minutes: $m, status: "queued"}' > "$FILENAME"
+          
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add "$FILENAME"
+          git commit -m "reserve $FILENAME"
+          git push origin main
