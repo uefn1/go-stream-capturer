@@ -30,6 +30,10 @@ type Downloaded struct {
 }
 
 func main() {
+	// ログの出力先を標準出力に設定（GitHub Actionsで見やすくするため）
+	log.SetOutput(os.Stdout)
+	log.Println("Starting go-stream-capturer...")
+
 	m3uURL := flag.String("url", "", "m3u8 url")
 	minutes := flag.Int("minutes", 0, "recording minutes")
 	split := flag.Int("split", 600, "split seconds")
@@ -38,8 +42,13 @@ func main() {
 	flag.Parse()
 
 	if *m3uURL == "" || *minutes == 0 {
-		log.Fatal("url and minutes are required")
+		log.Fatal("Error: url and minutes are required")
 	}
+
+	log.Printf("Target URL: %s\n", *m3uURL)
+	log.Printf("Recording Duration: %d minutes\n", *minutes)
+	log.Printf("File Split Interval: %d seconds\n", *split)
+	log.Printf("Release Tag: %s\n", *tag)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*minutes)*time.Minute)
 	defer cancel()
@@ -48,6 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to resolve master playlist: %v", err)
 	}
+	log.Printf("Resolved Media Playlist URL: %s\n", resolvedURL)
 
 	taskChan := make(chan *Segment, 100)
 	resultChan := make(chan *Downloaded, 100)
@@ -62,7 +72,7 @@ func main() {
 	// ループB: ダウンローダー6並列
 	for i := 0; i < 6; i++ {
 		wg.Add(1)
-		go downloader(ctx, &wg, taskChan, resultChan)
+		go downloader(ctx, &wg, i+1, taskChan, resultChan)
 	}
 
 	// 書き込み・順序管理・ファイルローテーション・逐次アップロード
@@ -70,7 +80,7 @@ func main() {
 	go writer(ctx, &wg, resultChan, firstSeqChan, *outDir, *split, *tag)
 
 	wg.Wait()
-	log.Println("Recording finished")
+	log.Println("Recording successfully finished and all files are processed.")
 }
 
 func resolveMaster(playlistURL string) (string, error) {
@@ -129,16 +139,19 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 	for {
 		select {
 		case <-ctx.Done():
+			log.Println("[Monitor] Stop monitoring playlist.")
 			return
 		case <-ticker.C:
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "GET", playlistURL, nil)
 		if err != nil {
+			log.Printf("[Monitor] Request creation failed: %v\n", err)
 			continue
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			log.Printf("[Monitor] Playlist fetch failed: %v\n", err)
 			continue
 		}
 
@@ -164,6 +177,8 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 				seen[seq] = true
 				u, _ := url.Parse(seg.URI)
 				segURL := baseURL.ResolveReference(u).String()
+				
+				log.Printf("[Monitor] Found new segment -> Seq: %d\n", seq)
 				taskChan <- &Segment{URL: segURL, Seq: seq}
 
 				if first {
@@ -175,6 +190,7 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 			}
 		}
 		if first && found {
+			log.Printf("[Monitor] First segment sequence detected: %d\n", minSeq)
 			firstSeqChan <- minSeq
 			first = false
 		}
@@ -182,19 +198,27 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 	}
 }
 
-func downloader(ctx context.Context, wg *sync.WaitGroup, taskChan <-chan *Segment, resultChan chan<- *Downloaded) {
+func downloader(ctx context.Context, wg *sync.WaitGroup, workerID int, taskChan <-chan *Segment, resultChan chan<- *Downloaded) {
 	defer wg.Done()
 	client := &http.Client{Timeout: 45 * time.Second}
 
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("[Downloader-%d] Stop working.\n", workerID)
 			return
 		case task, ok := <-taskChan:
 			if !ok {
 				return
 			}
+			// log.Printf("[Downloader-%d] Start downloading Seq: %d\n", workerID, task.Seq)
 			data := downloadWithRetry(ctx, client, task.URL)
+			if data != nil {
+				log.Printf("[Downloader-%d] Success Seq: %d (Size: %d bytes)\n", workerID, task.Seq, len(data))
+			} else {
+				log.Printf("[Downloader-%d] Failed Seq: %d (Skipped)\n", workerID, task.Seq)
+			}
+			
 			select {
 			case <-ctx.Done():
 				return
@@ -234,6 +258,8 @@ func downloadWithRetry(ctx context.Context, client *http.Client, targetURL strin
 				} else {
 					resp.Body.Close()
 				}
+			} else {
+				log.Printf("[Retry] Network error on download: %v\n", err)
 			}
 		}
 
@@ -244,6 +270,8 @@ func downloadWithRetry(ctx context.Context, client *http.Client, targetURL strin
 		}
 		jitter := rand.Float64() * 3
 		sleepDur := time.Duration((delay + jitter) * float64(time.Second))
+
+		log.Printf("[Retry] Waiting %v to retry downloading...\n", sleepDur)
 
 		select {
 		case <-ctx.Done():
@@ -266,34 +294,37 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 
 	var uploadWg sync.WaitGroup
 
-	// ファイルを閉じて、別ゴルーチンでGitHubへアップロード
 	closeAndUpload := func(f *os.File, fname string) {
 		f.Close()
+		log.Printf("[Writer] Closed file: %s\n", fname)
 		if tag != "" {
 			uploadWg.Add(1)
 			go func(name string) {
 				defer uploadWg.Done()
-				log.Printf("Start uploading %s to release %s\n", name, tag)
-				// owner/repo を環境変数から取得（GitHub Actionsでの実行時用）
-				repo := os.Getenv("GITHUB_REPOSITORY")
+				log.Printf("[Uploader] Start uploading %s to release %s\n", name, tag)
+				
+				// 環境変数を取得 (GH_REPO もしくは GITHUB_REPOSITORY)
+				repo := os.Getenv("GH_REPO")
+				if repo == "" {
+					repo = os.Getenv("GITHUB_REPOSITORY")
+				}
 
 				for retry := 0; retry < 3; retry++ {
-					// ghコマンドの引数を組み立てる
 					args := []string{"release", "upload", tag, name, "--clobber"}
 					if repo != "" {
-						args = append(args, "-R", repo) // 明示的にリポジトリを指定
+						args = append(args, "-R", repo)
 					}
-
+					
 					cmd := exec.Command("gh", args...)
 					cmd.Stdout = os.Stdout
 					cmd.Stderr = os.Stderr
 					err := cmd.Run()
 					if err == nil {
-						log.Printf("Successfully uploaded %s\n", name)
+						log.Printf("[Uploader] Successfully uploaded %s\n", name)
 						os.Remove(name) // アップロード成功後にローカルファイルを削除
 						return
 					}
-					log.Printf("Failed to upload %s (attempt %d/3): %v\n", name, retry+1, err)
+					log.Printf("[Uploader] Failed to upload %s (attempt %d/3): %v\n", name, retry+1, err)
 					time.Sleep(5 * time.Second)
 				}
 			}(fname)
@@ -307,10 +338,10 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 		}
 	}
 
-	// プログラム終了時に現在書き込み中のファイルを閉じ、全てのアップロード完了を待機
 	defer func() {
 		closeCurrentFile()
 		uploadWg.Wait()
+		log.Println("[Writer] All uploads finished.")
 	}()
 
 	checkRotation := func() error {
@@ -319,12 +350,13 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 			currentFilename = fmt.Sprintf("%s-%03d.ts", outPrefix, currentFileIdx)
 			f, err := os.Create(currentFilename)
 			if err != nil {
+				log.Printf("[Writer] Failed to create file %s: %v\n", currentFilename, err)
 				return err
 			}
 			currentFile = f
 			currentFileIdx++
 			fileOpenTime = time.Now()
-			log.Printf("Created new file: %s\n", currentFilename)
+			log.Printf("[Writer] Created new file: %s\n", currentFilename)
 		}
 		return nil
 	}
@@ -352,7 +384,7 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 		case res := <-resultChan:
 			data := res.Data
 			if data == nil {
-				data = []byte{}
+				data = []byte{} // スキップされた場合の空データ
 			}
 			if firstSeqSet {
 				if res.Seq < nextSeq {
@@ -364,6 +396,7 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 						if len(d) > 0 {
 							if err := checkRotation(); err == nil {
 								currentFile.Write(d)
+								// log.Printf("[Writer] Wrote Seq: %d\n", nextSeq)
 							}
 						}
 						delete(buffer, nextSeq)
