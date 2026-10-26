@@ -278,7 +278,8 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 					cmd := exec.Command("gh", "release", "upload", tag, name, "--clobber")
 					cmd.Stdout = os.Stdout
 					cmd.Stderr = os.Stderr
-					if err := cmd.Run(); err == nil {
+					err := cmd.Run() // errをここで宣言してスコープを維持する
+					if err == nil {
 						log.Printf("Successfully uploaded %s\n", name)
 						os.Remove(name) // アップロード成功後にローカルファイルを削除
 						return
