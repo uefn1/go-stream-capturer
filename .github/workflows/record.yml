@@ -42,17 +42,16 @@ jobs:
           echo "TAG_NAME=rec-${CHANNEL}-${DATE_STR}" >> $GITHUB_ENV
 
       - name: record
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # 録画前にReleaseの器（タグ）を作成しておく
+          gh release create ${{ env.TAG_NAME }} --title "${{ env.TAG_NAME }}" --notes "Auto recorded" || true
+          
           cd recorder
           go mod tidy
-          go run ./main.go -url "$M3U_URL" -minutes "$MINUTES" -split 600 -out out
-          
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG_NAME }}
-          files: recorder/out-*.ts
-          token: ${{ github.token }}
+          # -tag を渡すことで、Go内で10分ごとに自動アップロードを実行
+          go run ./main.go -url "${{ env.M3U_URL }}" -minutes "${{ env.MINUTES }}" -split 600 -out out -tag "${{ env.TAG_NAME }}"
           
       - name: move to finished
         run: |
