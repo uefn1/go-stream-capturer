@@ -44,13 +44,12 @@ jobs:
       - name: record
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }} # これを追加！
         run: |
-          # 録画前にReleaseの器（タグ）を作成しておく
           gh release create ${{ env.TAG_NAME }} --title "${{ env.TAG_NAME }}" --notes "Auto recorded" || true
           
           cd recorder
           go mod tidy
-          # -tag を渡すことで、Go内で10分ごとに自動アップロードを実行
           go run ./main.go -url "${{ env.M3U_URL }}" -minutes "${{ env.MINUTES }}" -split 600 -out out -tag "${{ env.TAG_NAME }}"
           
       - name: move to finished
@@ -61,7 +60,6 @@ jobs:
           git mv "${{ inputs.json_path }}" "$DEST"
           git commit -m "finished ${{ inputs.json_path }}"
           
-          # checker等の並行処理によるリポジトリ更新と競合した場合に備えてリトライ
           for i in {1..10}; do
             git pull --rebase origin main
             if git push origin main; then
