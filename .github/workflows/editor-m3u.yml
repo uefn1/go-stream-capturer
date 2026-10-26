@@ -1,0 +1,52 @@
+name: Editor M3U
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'add or delete'
+        required: true
+        type: choice
+        options: [add, delete]
+      channel_short_name:
+        description: 'add/delete共通 short_name'
+        required: true
+        type: string
+      channel_formal_name:
+        description: 'add時のみ必須'
+        required: false
+        type: string
+      m3u_url:
+        description: 'add時のみ必須 https://...'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: edit config
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          
+          if [ "${{ inputs.action }}" = "add" ]; then
+            if [[ ! "${{ inputs.m3u_url }}" =~ ^https:// ]]; then
+              echo "Error: URL must start with https://"
+              exit 1
+            fi
+            jq 'map(select(.short_name != "${{ inputs.channel_short_name }}")) + [{"short_name": "${{ inputs.channel_short_name }}", "formal_name": "${{ inputs.channel_formal_name }}", "m3u_url": "${{ inputs.m3u_url }}"}]' config.json > tmp.json
+            mv tmp.json config.json
+            git add config.json
+            git commit -m "add ${{ inputs.channel_short_name }}"
+          elif [ "${{ inputs.action }}" = "delete" ]; then
+            jq 'map(select(.short_name != "${{ inputs.channel_short_name }}"))' config.json > tmp.json
+            mv tmp.json config.json
+            git add config.json
+            git commit -m "delete ${{ inputs.channel_short_name }}"
+          fi
+          git push origin main
