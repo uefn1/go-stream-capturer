@@ -1,8 +1,9 @@
 name: Record
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       json_path:
+        description: 'path to the json file'
         required: true
         type: string
 
