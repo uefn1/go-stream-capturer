@@ -30,24 +30,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: edit config
+        env:
+          ACTION: ${{ inputs.action }}
+          CHANNEL_SHORT_NAME: ${{ inputs.channel_short_name }}
+          CHANNEL_FORMAL_NAME: ${{ inputs.channel_formal_name }}
+          M3U_URL: ${{ inputs.m3u_url }}
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           
-          if [ "${{ inputs.action }}" = "add" ]; then
-            # http:// または https:// で始まるかをチェック（httpを許容）
-            if [[ ! "${{ inputs.m3u_url }}" =~ ^https?:// ]]; then
+          if [ "$ACTION" = "add" ]; then
+            # http:// または https:// で始まるかをチェック
+            if [[ ! "$M3U_URL" =~ ^https?:// ]]; then
               echo "Error: URL must start with http:// or https://"
               exit 1
             fi
-            jq 'map(select(.short_name != "${{ inputs.channel_short_name }}")) + [{"short_name": "${{ inputs.channel_short_name }}", "formal_name": "${{ inputs.channel_formal_name }}", "m3u_url": "${{ inputs.m3u_url }}"}]' config.json > tmp.json
+            
+            # 環境変数と jq の --arg を使って安全にJSONを組み立てる（インジェクション対策）
+            jq --arg sn "$CHANNEL_SHORT_NAME" \
+               --arg fn "$CHANNEL_FORMAL_NAME" \
+               --arg url "$M3U_URL" \
+               'map(select(.short_name != $sn)) + [{"short_name": $sn, "formal_name": $fn, "m3u_url": $url}]' \
+               config.json > tmp.json
             mv tmp.json config.json
             git add config.json
-            git commit -m "add ${{ inputs.channel_short_name }}"
-          elif [ "${{ inputs.action }}" = "delete" ]; then
-            jq 'map(select(.short_name != "${{ inputs.channel_short_name }}"))' config.json > tmp.json
+            git commit -m "add $CHANNEL_SHORT_NAME"
+            
+          elif [ "$ACTION" = "delete" ]; then
+            jq --arg sn "$CHANNEL_SHORT_NAME" \
+               'map(select(.short_name != $sn))' \
+               config.json > tmp.json
             mv tmp.json config.json
             git add config.json
-            git commit -m "delete ${{ inputs.channel_short_name }}"
+            git commit -m "delete $CHANNEL_SHORT_NAME"
           fi
+          
           git push origin main
