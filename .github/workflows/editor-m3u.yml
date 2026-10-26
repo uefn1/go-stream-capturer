@@ -16,7 +16,7 @@ on:
         required: false
         type: string
       m3u_url:
-        description: 'add時のみ必須 https://...'
+        description: 'add時のみ必須 http:// または https://...'
         required: false
         type: string
 
@@ -35,8 +35,9 @@ jobs:
           git config user.email "actions@github.com"
           
           if [ "${{ inputs.action }}" = "add" ]; then
-            if [[ ! "${{ inputs.m3u_url }}" =~ ^https:// ]]; then
-              echo "Error: URL must start with https://"
+            # http:// または https:// で始まるかをチェック（httpを許容）
+            if [[ ! "${{ inputs.m3u_url }}" =~ ^https?:// ]]; then
+              echo "Error: URL must start with http:// or https://"
               exit 1
             fi
             jq 'map(select(.short_name != "${{ inputs.channel_short_name }}")) + [{"short_name": "${{ inputs.channel_short_name }}", "formal_name": "${{ inputs.channel_formal_name }}", "m3u_url": "${{ inputs.m3u_url }}"}]' config.json > tmp.json
