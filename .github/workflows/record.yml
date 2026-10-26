@@ -60,4 +60,16 @@ jobs:
           DEST="finished/$(basename "${{ inputs.json_path }}")"
           git mv "${{ inputs.json_path }}" "$DEST"
           git commit -m "finished ${{ inputs.json_path }}"
-          git push origin main
+          
+          # checker等の並行処理によるリポジトリ更新と競合した場合に備えてリトライ
+          for i in {1..10}; do
+            git pull --rebase origin main
+            if git push origin main; then
+              echo "Successfully pushed"
+              exit 0
+            fi
+            sleep $(( RANDOM % 3 + 2 ))
+          done
+          
+          echo "Failed to push after 10 retries"
+          exit 1
