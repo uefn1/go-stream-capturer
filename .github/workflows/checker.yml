@@ -1,0 +1,54 @@
+name: Checker
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  check-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - name: daemon loop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          
+          # 60分間ループ（1分おき）
+          END_TIME=$(( $(date +%s) + 3600 ))
+          
+          while [ $(date +%s) -lt $END_TIME ]; do
+            git pull origin main || true
+            
+            for file in queue/*.json; do
+              [ -e "$file" ] || continue
+              
+              START_AT=$(jq -r '.start_at' "$file")
+              # JSTをEpoch秒に変換
+              START_EPOCH=$(TZ=Asia/Tokyo date -d "$START_AT" +%s 2>/dev/null || date -d "${START_AT}+09:00" +%s)
+              NOW=$(date +%s)
+              
+              # 開始10分前(600秒) 以降なら実行
+              if [ $NOW -ge $((START_EPOCH - 600)) ]; then
+                echo "Starting record for $file"
+                NEW_FILE="running/$(basename "$file")"
+                
+                git mv "$file" "$NEW_FILE"
+                jq '.status = "running"' "$NEW_FILE" > tmp.json && mv tmp.json "$NEW_FILE"
+                git commit -m "running $NEW_FILE"
+                git push origin main
+                
+                # 対象のジョブを呼び出し
+                gh workflow run record.yml -R ${{ github.repository }} -f json_path="$NEW_FILE"
+              fi
+            done
+            sleep 60
+          done
+          
+          # 60分経過後、再起動
+          gh workflow run checker.yml -R ${{ github.repository }}
