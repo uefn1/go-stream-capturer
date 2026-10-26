@@ -33,24 +33,27 @@ jobs:
           
           if [ -z "$M3U_URL" ] || [ "$M3U_URL" = "null" ]; then echo "URL not found"; exit 1; fi
           
+          START_JST=$(jq -r '.start_at' "${{ inputs.json_path }}")
+          DATE_STR=$(echo "$START_JST" | awk -F' ' '{gsub("-","",$1); gsub(":","",$2); print $1"-"$2}')
+          
           echo "CHANNEL=$CHANNEL" >> $GITHUB_ENV
           echo "MINUTES=$MINUTES" >> $GITHUB_ENV
           echo "M3U_URL=$M3U_URL" >> $GITHUB_ENV
-          
-          START_JST=$(jq -r '.start_at' "${{ inputs.json_path }}")
-          DATE_STR=$(echo "$START_JST" | awk -F' ' '{gsub("-","",$1); gsub(":","",$2); print $1"-"$2}')
+          echo "START_JST=$START_JST" >> $GITHUB_ENV
           echo "TAG_NAME=rec-${CHANNEL}-${DATE_STR}" >> $GITHUB_ENV
 
       - name: record
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }} # これを追加！
+          GH_REPO: ${{ github.repository }}
         run: |
+          # 録画前にReleaseの器（タグ）を作成しておく
           gh release create ${{ env.TAG_NAME }} --title "${{ env.TAG_NAME }}" --notes "Auto recorded" || true
           
           cd recorder
           go mod tidy
-          go run ./main.go -url "${{ env.M3U_URL }}" -minutes "${{ env.MINUTES }}" -split 600 -out out -tag "${{ env.TAG_NAME }}"
+          # -start を追加し、Goプログラム内で指定時間まで待機させる
+          go run ./main.go -url "${{ env.M3U_URL }}" -minutes "${{ env.MINUTES }}" -split 600 -out out -tag "${{ env.TAG_NAME }}" -start "${{ env.START_JST }}"
           
       - name: move to finished
         run: |
