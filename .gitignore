@@ -1,9 +1,3 @@
 out-*.ts
 *.tmp
 recorder/recorder
-queue/*.json
-running/*.json
-finished/*.json
-!queue/.gitkeep
-!running/.gitkeep
-!finished/.gitkeep
