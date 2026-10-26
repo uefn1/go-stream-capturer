@@ -30,7 +30,7 @@ type Downloaded struct {
 }
 
 func main() {
-	// ログの出力先を標準出力に設定（GitHub Actionsで見やすくするため）
+	// ログの出力先を標準出力に設定
 	log.SetOutput(os.Stdout)
 	log.Println("Starting go-stream-capturer...")
 
@@ -39,6 +39,7 @@ func main() {
 	split := flag.Int("split", 600, "split seconds")
 	outDir := flag.String("out", "out", "output prefix")
 	tag := flag.String("tag", "", "github release tag for auto upload")
+	startStr := flag.String("start", "", "start time (YYYY-MM-DD HH:MM in JST)")
 	flag.Parse()
 
 	if *m3uURL == "" || *minutes == 0 {
@@ -49,7 +50,30 @@ func main() {
 	log.Printf("Recording Duration: %d minutes\n", *minutes)
 	log.Printf("File Split Interval: %d seconds\n", *split)
 	log.Printf("Release Tag: %s\n", *tag)
+	if *startStr != "" {
+		log.Printf("Scheduled Start Time (JST): %s\n", *startStr)
+	}
 
+	// === 開始時間までの待機処理 ===
+	if *startStr != "" {
+		loc := time.FixedZone("JST", 9*60*60)
+		startTime, err := time.ParseInLocation("2006-01-02 15:04", *startStr, loc)
+		if err != nil {
+			log.Printf("Warning: failed to parse start time (%s): %v\n", *startStr, err)
+		} else {
+			now := time.Now().In(loc)
+			if now.Before(startTime) {
+				waitDur := startTime.Sub(now)
+				log.Printf("Waiting %v until recording start time...\n", waitDur)
+				time.Sleep(waitDur)
+				log.Println("Start time reached. Initiating recording.")
+			} else {
+				log.Println("Start time has already passed. Initiating recording immediately.")
+			}
+		}
+	}
+
+	// 録画時間（minutes）のカウントダウンは、待機終了直後のここから開始される
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*minutes)*time.Minute)
 	defer cancel()
 
@@ -211,7 +235,6 @@ func downloader(ctx context.Context, wg *sync.WaitGroup, workerID int, taskChan 
 			if !ok {
 				return
 			}
-			// log.Printf("[Downloader-%d] Start downloading Seq: %d\n", workerID, task.Seq)
 			data := downloadWithRetry(ctx, client, task.URL)
 			if data != nil {
 				log.Printf("[Downloader-%d] Success Seq: %d (Size: %d bytes)\n", workerID, task.Seq, len(data))
@@ -303,7 +326,6 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 				defer uploadWg.Done()
 				log.Printf("[Uploader] Start uploading %s to release %s\n", name, tag)
 				
-				// 環境変数を取得 (GH_REPO もしくは GITHUB_REPOSITORY)
 				repo := os.Getenv("GH_REPO")
 				if repo == "" {
 					repo = os.Getenv("GITHUB_REPOSITORY")
@@ -396,7 +418,6 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 						if len(d) > 0 {
 							if err := checkRotation(); err == nil {
 								currentFile.Write(d)
-								// log.Printf("[Writer] Wrote Seq: %d\n", nextSeq)
 							}
 						}
 						delete(buffer, nextSeq)
