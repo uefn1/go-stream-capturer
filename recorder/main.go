@@ -54,7 +54,7 @@ func main() {
 		log.Printf("Scheduled Start Time (JST): %s\n", *startStr)
 	}
 
-	// === 開始時間までの待機処理 ===
+	// === 開始時間までの待機処理（1ミリ秒の精度で0秒に合わせる） ===
 	if *startStr != "" {
 		loc := time.FixedZone("JST", 9*60*60)
 		startTime, err := time.ParseInLocation("2006-01-02 15:04", *startStr, loc)
@@ -64,16 +64,16 @@ func main() {
 			now := time.Now().In(loc)
 			if now.Before(startTime) {
 				waitDur := startTime.Sub(now)
-				log.Printf("Waiting %v until recording start time...\n", waitDur)
+				log.Printf("Waiting %v until recording start time (precisely at 00 seconds)...\n", waitDur)
 				time.Sleep(waitDur)
-				log.Println("Start time reached. Initiating recording.")
+				log.Println("Start time reached (00 seconds). Initiating recording immediately!")
 			} else {
 				log.Println("Start time has already passed. Initiating recording immediately.")
 			}
 		}
 	}
 
-	// 録画時間（minutes）のカウントダウンは、待機終了直後のここから開始される
+	// 録画時間（minutes）のタイムアウト設定
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*minutes)*time.Minute)
 	defer cancel()
 
@@ -89,7 +89,7 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	// ループA: プレイリスト監視
+	// ループA: プレイリスト監視 (待機なし・即時実行)
 	wg.Add(1)
 	go monitorPlaylist(ctx, &wg, resolvedURL, taskChan, firstSeqChan)
 
@@ -157,32 +157,23 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 	var mu sync.Mutex
 	first := true
 
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("[Monitor] Stop monitoring playlist.")
-			return
-		case <-ticker.C:
-		}
-
+	// プレイリストを取得してセグメントを抽出するインナー関数（0秒での即時実行用）
+	fetchAndProcess := func() {
 		req, err := http.NewRequestWithContext(ctx, "GET", playlistURL, nil)
 		if err != nil {
 			log.Printf("[Monitor] Request creation failed: %v\n", err)
-			continue
+			return
 		}
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("[Monitor] Playlist fetch failed: %v\n", err)
-			continue
+			return
 		}
 
 		p, listType, err := m3u8.DecodeFrom(resp.Body, true)
 		resp.Body.Close()
 		if err != nil || listType != m3u8.MEDIA {
-			continue
+			return
 		}
 
 		media := p.(*m3u8.MediaPlaylist)
@@ -219,6 +210,23 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 			first = false
 		}
 		mu.Unlock()
+	}
+
+	// 1回目のセグメント取得を開始時刻ちょうど（0秒）に即座に実行
+	fetchAndProcess()
+
+	// 2秒おきの監視サイクルを設定
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[Monitor] Stop monitoring playlist.")
+			return
+		case <-ticker.C:
+			fetchAndProcess()
+		}
 	}
 }
 
