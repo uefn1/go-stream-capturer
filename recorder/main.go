@@ -29,10 +29,16 @@ type Downloaded struct {
 	Data []byte
 }
 
+// fMP4 INIT用
+var (
+	mapMu   sync.Mutex
+	mapData []byte
+	mapURL  string
+)
+
 func main() {
-	// ログの出力先を標準出力に設定
 	log.SetOutput(os.Stdout)
-	log.Println("Starting go-stream-capturer...")
+	log.Println("Starting go-stream-capturer (fixed fMP4 & precision-0s version)...")
 
 	m3uURL := flag.String("url", "", "m3u8 url")
 	minutes := flag.Int("minutes", 0, "recording minutes")
@@ -54,7 +60,7 @@ func main() {
 		log.Printf("Scheduled Start Time (JST): %s\n", *startStr)
 	}
 
-	// === 開始時間までの待機処理（1ミリ秒の精度で0秒に合わせる） ===
+	// === 開始時間までの待機処理（00秒ちょうどに補正して待機） ===
 	if *startStr != "" {
 		loc := time.FixedZone("JST", 9*60*60)
 		startTime, err := time.ParseInLocation("2006-01-02 15:04", *startStr, loc)
@@ -73,7 +79,7 @@ func main() {
 		}
 	}
 
-	// 録画時間（minutes）のタイムアウト設定
+	// 録画時間（minutes）のカウントダウン開始
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*minutes)*time.Minute)
 	defer cancel()
 
@@ -89,17 +95,14 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	// ループA: プレイリスト監視 (待機なし・即時実行)
 	wg.Add(1)
 	go monitorPlaylist(ctx, &wg, resolvedURL, taskChan, firstSeqChan)
 
-	// ループB: ダウンローダー6並列
 	for i := 0; i < 6; i++ {
 		wg.Add(1)
 		go downloader(ctx, &wg, i+1, taskChan, resultChan)
 	}
 
-	// 書き込み・順序管理・ファイルローテーション・逐次アップロード
 	wg.Add(1)
 	go writer(ctx, &wg, resultChan, firstSeqChan, *outDir, *split, *tag)
 
@@ -157,11 +160,9 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 	var mu sync.Mutex
 	first := true
 
-	// プレイリストを取得してセグメントを抽出するインナー関数（0秒での即時実行用）
 	fetchAndProcess := func() {
 		req, err := http.NewRequestWithContext(ctx, "GET", playlistURL, nil)
 		if err != nil {
-			log.Printf("[Monitor] Request creation failed: %v\n", err)
 			return
 		}
 		resp, err := client.Do(req)
@@ -179,6 +180,32 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 		media := p.(*m3u8.MediaPlaylist)
 		baseURL, _ := url.Parse(playlistURL)
 
+		// === fMP4対応: EXT-X-MAP取得 (初回のみ) ===
+		if media.Map != nil {
+			mapMu.Lock()
+			if mapData == nil {
+				u, _ := url.Parse(media.Map.URI)
+				mURL := baseURL.ResolveReference(u).String()
+				mapURL = mURL
+				log.Printf("[Monitor] Found EXT-X-MAP: %s\n", mURL)
+				// INIT取得
+				reqMap, _ := http.NewRequestWithContext(ctx, "GET", mURL, nil)
+				respMap, err := client.Do(reqMap)
+				if err == nil && respMap.StatusCode == 200 {
+					data, _ := io.ReadAll(respMap.Body)
+					respMap.Body.Close()
+					mapData = data
+					log.Printf("[Monitor] Got INIT map %d bytes\n", len(mapData))
+				} else {
+					if respMap != nil {
+						respMap.Body.Close()
+					}
+					log.Printf("[Monitor] Failed to fetch MAP")
+				}
+			}
+			mapMu.Unlock()
+		}
+
 		mu.Lock()
 		var minSeq uint64 = math.MaxUint64
 		var found bool
@@ -192,10 +219,8 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 				seen[seq] = true
 				u, _ := url.Parse(seg.URI)
 				segURL := baseURL.ResolveReference(u).String()
-				
 				log.Printf("[Monitor] Found new segment -> Seq: %d\n", seq)
 				taskChan <- &Segment{URL: segURL, Seq: seq}
-
 				if first {
 					if seq < minSeq {
 						minSeq = seq
@@ -212,10 +237,9 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 		mu.Unlock()
 	}
 
-	// 1回目のセグメント取得を開始時刻ちょうど（0秒）に即座に実行
+	// 待機完了後の0秒時点にディレイ無しで初回取得を実行
 	fetchAndProcess()
 
-	// 2秒おきの監視サイクルを設定
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -233,7 +257,6 @@ func monitorPlaylist(ctx context.Context, wg *sync.WaitGroup, playlistURL string
 func downloader(ctx context.Context, wg *sync.WaitGroup, workerID int, taskChan <-chan *Segment, resultChan chan<- *Downloaded) {
 	defer wg.Done()
 	client := &http.Client{Timeout: 45 * time.Second}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -245,11 +268,10 @@ func downloader(ctx context.Context, wg *sync.WaitGroup, workerID int, taskChan 
 			}
 			data := downloadWithRetry(ctx, client, task.URL)
 			if data != nil {
-				log.Printf("[Downloader-%d] Success Seq: %d (Size: %d bytes)\n", workerID, task.Seq, len(data))
+				log.Printf("[Downloader-%d] Success Seq: %d (%d bytes)\n", workerID, task.Seq, len(data))
 			} else {
 				log.Printf("[Downloader-%d] Failed Seq: %d (Skipped)\n", workerID, task.Seq)
 			}
-			
 			select {
 			case <-ctx.Done():
 				return
@@ -262,14 +284,12 @@ func downloader(ctx context.Context, wg *sync.WaitGroup, workerID int, taskChan 
 func downloadWithRetry(ctx context.Context, client *http.Client, targetURL string) []byte {
 	retryCount := 0
 	notFoundCount := 0
-
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
 		}
-
 		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 		if err == nil {
 			resp, err := client.Do(req)
@@ -289,11 +309,8 @@ func downloadWithRetry(ctx context.Context, client *http.Client, targetURL strin
 				} else {
 					resp.Body.Close()
 				}
-			} else {
-				log.Printf("[Retry] Network error on download: %v\n", err)
 			}
 		}
-
 		retryCount++
 		delay := float64(2) * math.Pow(2, float64(retryCount-1))
 		if delay > 30 {
@@ -301,9 +318,7 @@ func downloadWithRetry(ctx context.Context, client *http.Client, targetURL strin
 		}
 		jitter := rand.Float64() * 3
 		sleepDur := time.Duration((delay + jitter) * float64(time.Second))
-
-		log.Printf("[Retry] Waiting %v to retry downloading...\n", sleepDur)
-
+		log.Printf("[Retry] Waiting %v to retry...\n", sleepDur)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -322,7 +337,6 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 	var currentFileIdx int
 	var fileOpenTime time.Time
 	var currentFilename string
-
 	var uploadWg sync.WaitGroup
 
 	closeAndUpload := func(f *os.File, fname string) {
@@ -333,25 +347,22 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 			go func(name string) {
 				defer uploadWg.Done()
 				log.Printf("[Uploader] Start uploading %s to release %s\n", name, tag)
-				
 				repo := os.Getenv("GH_REPO")
 				if repo == "" {
 					repo = os.Getenv("GITHUB_REPOSITORY")
 				}
-
 				for retry := 0; retry < 3; retry++ {
 					args := []string{"release", "upload", tag, name, "--clobber"}
 					if repo != "" {
 						args = append(args, "-R", repo)
 					}
-					
 					cmd := exec.Command("gh", args...)
 					cmd.Stdout = os.Stdout
 					cmd.Stderr = os.Stderr
 					err := cmd.Run()
 					if err == nil {
 						log.Printf("[Uploader] Successfully uploaded %s\n", name)
-						os.Remove(name) // アップロード成功後にローカルファイルを削除
+						os.Remove(name)
 						return
 					}
 					log.Printf("[Uploader] Failed to upload %s (attempt %d/3): %v\n", name, retry+1, err)
@@ -377,7 +388,14 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 	checkRotation := func() error {
 		if currentFile == nil || time.Since(fileOpenTime).Seconds() >= float64(splitSec) {
 			closeCurrentFile()
-			currentFilename = fmt.Sprintf("%s-%03d.ts", outPrefix, currentFileIdx)
+			mapMu.Lock()
+			isFMP4 := len(mapData) > 0
+			mapMu.Unlock()
+			ext := "ts"
+			if isFMP4 {
+				ext = "mp4" // fMP4はmp4拡張子が正しい
+			}
+			currentFilename = fmt.Sprintf("%s-%03d.%s", outPrefix, currentFileIdx, ext)
 			f, err := os.Create(currentFilename)
 			if err != nil {
 				log.Printf("[Writer] Failed to create file %s: %v\n", currentFilename, err)
@@ -387,6 +405,14 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 			currentFileIdx++
 			fileOpenTime = time.Now()
 			log.Printf("[Writer] Created new file: %s\n", currentFilename)
+
+			// fMP4なら先頭にINIT（EXT-X-MAP）データを結合
+			mapMu.Lock()
+			if len(mapData) > 0 {
+				f.Write(mapData)
+				log.Printf("[Writer] Wrote INIT header (%d bytes) to %s\n", len(mapData), currentFilename)
+			}
+			mapMu.Unlock()
 		}
 		return nil
 	}
@@ -414,7 +440,7 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 		case res := <-resultChan:
 			data := res.Data
 			if data == nil {
-				data = []byte{} // スキップされた場合の空データ
+				data = []byte{}
 			}
 			if firstSeqSet {
 				if res.Seq < nextSeq {
