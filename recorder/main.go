@@ -274,11 +274,20 @@ func writer(ctx context.Context, wg *sync.WaitGroup, resultChan <-chan *Download
 			go func(name string) {
 				defer uploadWg.Done()
 				log.Printf("Start uploading %s to release %s\n", name, tag)
+				// owner/repo を環境変数から取得（GitHub Actionsでの実行時用）
+				repo := os.Getenv("GITHUB_REPOSITORY")
+
 				for retry := 0; retry < 3; retry++ {
-					cmd := exec.Command("gh", "release", "upload", tag, name, "--clobber")
+					// ghコマンドの引数を組み立てる
+					args := []string{"release", "upload", tag, name, "--clobber"}
+					if repo != "" {
+						args = append(args, "-R", repo) // 明示的にリポジトリを指定
+					}
+
+					cmd := exec.Command("gh", args...)
 					cmd.Stdout = os.Stdout
 					cmd.Stderr = os.Stderr
-					err := cmd.Run() // errをここで宣言してスコープを維持する
+					err := cmd.Run()
 					if err == nil {
 						log.Printf("Successfully uploaded %s\n", name)
 						os.Remove(name) // アップロード成功後にローカルファイルを削除
