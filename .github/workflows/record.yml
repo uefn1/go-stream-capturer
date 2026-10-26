@@ -1,0 +1,63 @@
+name: Record
+on:
+  workflow_call:
+    inputs:
+      json_path:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: rec-${{ inputs.json_path }}
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.22
+      - name: get config
+        id: config
+        run: |
+          CHANNEL=$(jq -r '.channel' "${{ inputs.json_path }}")
+          MINUTES=$(jq -r '.minutes' "${{ inputs.json_path }}")
+          M3U_URL=$(jq -r --arg c "$CHANNEL" '.[] | select(.short_name == $c) | .m3u_url' config.json)
+          
+          if [ -z "$M3U_URL" ] || [ "$M3U_URL" = "null" ]; then echo "URL not found"; exit 1; fi
+          
+          echo "CHANNEL=$CHANNEL" >> $GITHUB_ENV
+          echo "MINUTES=$MINUTES" >> $GITHUB_ENV
+          echo "M3U_URL=$M3U_URL" >> $GITHUB_ENV
+          
+          START_JST=$(jq -r '.start_at' "${{ inputs.json_path }}")
+          DATE_STR=$(echo "$START_JST" | awk -F' ' '{gsub("-","",$1); gsub(":","",$2); print $1"-"$2}')
+          echo "TAG_NAME=rec-${CHANNEL}-${DATE_STR}" >> $GITHUB_ENV
+
+      - name: record
+        run: |
+          cd recorder
+          go mod tidy
+          go run ./main.go -url "$M3U_URL" -minutes "$MINUTES" -split 600 -out out
+          
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          files: recorder/out-*.ts
+          token: ${{ github.token }}
+          
+      - name: move to finished
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          DEST="finished/$(basename "${{ inputs.json_path }}")"
+          git mv "${{ inputs.json_path }}" "$DEST"
+          git commit -m "finished ${{ inputs.json_path }}"
+          git push origin main
