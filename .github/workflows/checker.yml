@@ -12,6 +12,8 @@ jobs:
     timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 全履歴をフェッチしてブランチ追跡を安定化
       - name: daemon loop
         env:
           GH_TOKEN: ${{ github.token }}
@@ -23,7 +25,9 @@ jobs:
           END_TIME=$(( $(date +%s) + 3600 ))
           
           while [ $(date +%s) -lt $END_TIME ]; do
-            git pull origin main || true
+            # 【重要】マージ競合を100%回避する自己修復プル
+            git fetch origin main
+            git reset --hard origin/main
             
             for file in queue/*.json; do
               [ -e "$file" ] || continue
@@ -41,14 +45,30 @@ jobs:
                 git mv "$file" "$NEW_FILE"
                 jq '.status = "running"' "$NEW_FILE" > tmp.json && mv tmp.json "$NEW_FILE"
                 git commit -m "running $NEW_FILE"
-                git push origin main
                 
-                # 対象のジョブを呼び出し
-                gh workflow run record.yml -R ${{ github.repository }} -f json_path="$NEW_FILE"
+                # プッシュが成功するまでリトライ（競合を完全に回避）
+                PUSH_SUCCESS=false
+                for i in {1..5}; do
+                  if git push origin main; then
+                    PUSH_SUCCESS=true
+                    break
+                  fi
+                  echo "Push failed. Retrying in few seconds..."
+                  sleep $(( RANDOM % 3 + 2 ))
+                  git fetch origin main
+                  git rebase origin/main || git rebase --abort
+                done
+                
+                # プッシュが成功した場合のみWorkflowを起動
+                if [ "$PUSH_SUCCESS" = true ]; then
+                  gh workflow run record.yml -R ${{ github.repository }} -f json_path="$NEW_FILE"
+                else
+                  echo "Skipping workflow trigger because git push failed."
+                fi
               fi
             done
             sleep 60
           done
           
-          # 60分経過後、再起動
+          # 60分経過後、デーモン自身を再起動
           gh workflow run checker.yml -R ${{ github.repository }}
